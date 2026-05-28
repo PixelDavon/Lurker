@@ -1,0 +1,5 @@
+{
+  "max_threads": 8,
+  "webhook_url": "",
+  "output_dir": "output"
+}
