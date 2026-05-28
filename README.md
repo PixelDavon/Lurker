@@ -17,7 +17,7 @@ I made this to practice connecting messy network probing with more organized sec
 
 ## Getting started
 ```bash
-git clone 
+git clone https://github.com/PixelDavon/Lurker.git
 cd lurker
 # optional: makes the terminal output look nicer
 pip install colorama tqdm
