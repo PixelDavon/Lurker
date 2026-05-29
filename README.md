@@ -1,7 +1,7 @@
 # Lurker 🕵️‍♂️
-A lightweight endpoint reconnaissance tool I built for developers who want to keep an eye on their apps. Scans a website, looks for exposed paths, audits the security headers, and warns about changes in paths/headers.
+A lightweight endpoint recon tool I built for devs who want to keep an eye on their site. Scans website, looks for exposed paths, audits security headers, and warns about changes in paths/headers.
 
-I made this to practice connecting messy network probing with more organized security monitoring.
+I built this project to get better at taking messy, raw network data and turning it into something useful for security monitoring.
 
 ## interesting-enough features
 * Uses **multi-threading** to check endpoints quickly.
@@ -85,6 +85,9 @@ Only a few security-related headers are stored, and they are saved in lowercase 
 * `content-security-policy`
 * `x-frame-options`
 * `strict-transport-security`
+* `x-content-type-options`
+* `referrer-policy`
+* `permissions-policy`
 
 Example history file path:
 
@@ -95,7 +98,7 @@ output/example_com/history/2025-06-17_1430.json
 ## How the diff works
 After a scan, Lurker compares the new results against the previous state and reports:
 * **New** - endpoints that were not seen before
-* **Regressions** - a status code changed, or a security header that used to exist is now missing
+* **Regressions** - a status code changed, a security header that used to exist is now missing, or a stored header value became unsafe (for example, `X-Frame-Options` changing from `DENY` to `ALLOWALL`)
 * **Removed** - endpoints that used to respond but no longer do
 
 If changes are found, Lurker prints a summary to the terminal. (or a Discord alert given a webhook url)
@@ -132,4 +135,3 @@ python -m unittest discover -v
 * Discord webhook requests use a 10 second timeout.
 * The tool does not store every header, only the ones that matter for basic security checks.
 * The saved state is overwritten with the latest scan results.
-

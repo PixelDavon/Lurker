@@ -21,6 +21,33 @@ class TestProbeEndpoint(unittest.TestCase):
         self.assertEqual(result, (200, {}))
 
     @patch("lurker.urllib.request.urlopen")
+    def test_probe_endpoint_retains_new_security_headers(self, mock_urlopen):
+        response = MagicMock()
+        response.getcode.return_value = 200
+        response.headers = {
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "strict-origin",
+            "Permissions-Policy": "geolocation=()",
+            "Content-Type": "text/html",
+        }
+        response.__enter__.return_value = response
+        mock_urlopen.return_value = response
+
+        result = lurker.probe_endpoint("https://example.com", "/admin")
+
+        self.assertEqual(
+            result,
+            (
+                200,
+                {
+                    "x-content-type-options": "nosniff",
+                    "referrer-policy": "strict-origin",
+                    "permissions-policy": "geolocation=()",
+                },
+            ),
+        )
+
+    @patch("lurker.urllib.request.urlopen")
     def test_probe_endpoint_returns_403_when_endpoint_exists(self, mock_urlopen):
         response = MagicMock()
         response.getcode.return_value = 403
@@ -174,6 +201,166 @@ class TestHeaderAuditor(unittest.TestCase):
         self.assertEqual(set(result), lurker.REQUIRED_SECURITY_HEADERS)
 
 
+class TestHeaderValueValidator(unittest.TestCase):
+    def test_xfo_deny_is_safe(self):
+        result = lurker.validate_header_values({"x-frame-options": "DENY"})
+        self.assertEqual(result, [])
+
+    def test_xfo_allowall_is_unsafe(self):
+        result = lurker.validate_header_values({"x-frame-options": "ALLOWALL"})
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "x-frame-options",
+                    "value": "ALLOWALL",
+                    "reason": "must be DENY or SAMEORIGIN",
+                }
+            ],
+        )
+
+    def test_hsts_sufficient_max_age_is_safe(self):
+        result = lurker.validate_header_values(
+            {"strict-transport-security": "max-age=31536000; includeSubDomains"}
+        )
+        self.assertEqual(result, [])
+
+    def test_hsts_insufficient_max_age_is_unsafe(self):
+        result = lurker.validate_header_values(
+            {"strict-transport-security": "max-age=100"}
+        )
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "strict-transport-security",
+                    "value": "max-age=100",
+                    "reason": "max-age must be at least 31536000",
+                }
+            ],
+        )
+
+    def test_hsts_missing_max_age_is_unsafe(self):
+        result = lurker.validate_header_values(
+            {"strict-transport-security": "includeSubDomains"}
+        )
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "strict-transport-security",
+                    "value": "includeSubDomains",
+                    "reason": "missing max-age",
+                }
+            ],
+        )
+
+    def test_hsts_non_integer_max_age_is_unsafe(self):
+        result = lurker.validate_header_values(
+            {"strict-transport-security": "max-age=abc"}
+        )
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "strict-transport-security",
+                    "value": "max-age=abc",
+                    "reason": "invalid max-age",
+                }
+            ],
+        )
+
+    def test_hsts_value_without_max_age_directive_is_unsafe(self):
+        result = lurker.validate_header_values({"strict-transport-security": "abc"})
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "strict-transport-security",
+                    "value": "abc",
+                    "reason": "missing max-age",
+                }
+            ],
+        )
+
+    def test_xcto_nosniff_is_safe(self):
+        result = lurker.validate_header_values({"x-content-type-options": "nosniff"})
+        self.assertEqual(result, [])
+
+    def test_xcto_wrong_value_is_unsafe(self):
+        result = lurker.validate_header_values({"x-content-type-options": "allow"})
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "x-content-type-options",
+                    "value": "allow",
+                    "reason": "must be nosniff",
+                }
+            ],
+        )
+
+    def test_csp_unsafe_inline_is_unsafe(self):
+        result = lurker.validate_header_values(
+            {"content-security-policy": "default-src 'self'; script-src 'unsafe-inline'"}
+        )
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "content-security-policy",
+                    "value": "default-src 'self'; script-src 'unsafe-inline'",
+                    "reason": "must not be empty, *, unsafe-inline, or unsafe-eval",
+                }
+            ],
+        )
+
+    def test_csp_wildcard_directive_is_unsafe(self):
+        result = lurker.validate_header_values(
+            {"content-security-policy": "default-src *; script-src 'self'"}
+        )
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "content-security-policy",
+                    "value": "default-src *; script-src 'self'",
+                    "reason": "must not be empty, *, unsafe-inline, or unsafe-eval",
+                }
+            ],
+        )
+
+    def test_referrer_unsafe_url_is_unsafe(self):
+        result = lurker.validate_header_values({"referrer-policy": "unsafe-url"})
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "referrer-policy",
+                    "value": "unsafe-url",
+                    "reason": "must not be empty, unsafe-url, or no-referrer-when-downgrade",
+                }
+            ],
+        )
+
+    def test_referrer_strict_origin_is_safe(self):
+        result = lurker.validate_header_values({"referrer-policy": "strict-origin"})
+        self.assertEqual(result, [])
+
+    def test_referrer_empty_value_is_unsafe(self):
+        result = lurker.validate_header_values({"referrer-policy": ""})
+        self.assertEqual(
+            result,
+            [
+                {
+                    "header": "referrer-policy",
+                    "value": "",
+                    "reason": "must not be empty, unsafe-url, or no-referrer-when-downgrade",
+                }
+            ],
+        )
+
+
 class TestDiffEngine(unittest.TestCase):
     def test_detect_changes_flags_missing_header_and_removed_path(self):
         old_state = {
@@ -228,6 +415,138 @@ class TestDiffEngine(unittest.TestCase):
         self.assertEqual(result["new"], ["/api"])
         self.assertEqual(result["regressions"], [])
         self.assertEqual(result["removed"], [])
+
+    def test_detect_changes_flags_safe_to_unsafe_value_as_regression(self):
+        old_state = {
+            "/admin": {
+                "status": 200,
+                "headers": {"x-frame-options": "DENY"},
+            }
+        }
+        new_state = {
+            "/admin": {
+                "status": 200,
+                "headers": {"x-frame-options": "ALLOWALL"},
+            }
+        }
+
+        result = lurker.detect_changes(old_state, new_state)
+
+        self.assertEqual(result["new"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(len(result["regressions"]), 1)
+        reasons = result["regressions"][0]["reasons"]
+        self.assertIn(
+            {
+                "type": "unsafe_header_value",
+                "header": "x-frame-options",
+                "old_value": "DENY",
+                "new_value": "ALLOWALL",
+                "reason": "must be DENY or SAMEORIGIN",
+            },
+            reasons,
+        )
+
+    def test_detect_changes_does_not_flag_already_unsafe_value(self):
+        old_state = {
+            "/admin": {
+                "status": 200,
+                "headers": {"x-frame-options": "ALLOWALL"},
+            }
+        }
+        new_state = {
+            "/admin": {
+                "status": 200,
+                "headers": {"x-frame-options": "DENY"},
+            }
+        }
+
+        result = lurker.detect_changes(old_state, new_state)
+
+        self.assertEqual(result["regressions"], [])
+
+    def test_detect_changes_flags_referrer_policy_empty_value_as_regression(self):
+        old_state = {
+            "/admin": {
+                "status": 200,
+                "headers": {"referrer-policy": "strict-origin"},
+            }
+        }
+        new_state = {
+            "/admin": {
+                "status": 200,
+                "headers": {"referrer-policy": ""},
+            }
+        }
+
+        result = lurker.detect_changes(old_state, new_state)
+
+        self.assertEqual(result["new"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(len(result["regressions"]), 1)
+        reasons = result["regressions"][0]["reasons"]
+        self.assertIn(
+            {
+                "type": "unsafe_header_value",
+                "header": "referrer-policy",
+                "old_value": "strict-origin",
+                "new_value": "",
+                "reason": "must not be empty, unsafe-url, or no-referrer-when-downgrade",
+            },
+            reasons,
+        )
+
+    def test_detect_changes_ignores_permissions_policy_value_changes(self):
+        old_state = {
+            "/admin": {
+                "status": 200,
+                "headers": {"permissions-policy": "geolocation=()"},
+            }
+        }
+        new_state = {
+            "/admin": {
+                "status": 200,
+                "headers": {"permissions-policy": "camera=()"},
+            }
+        }
+
+        result = lurker.detect_changes(old_state, new_state)
+
+        self.assertEqual(result["new"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["regressions"], [])
+
+    def test_render_diff_summary_includes_unsafe_header_value(self):
+        previous_no_color = lurker.NO_COLOR
+        lurker.NO_COLOR = True
+        try:
+            summary = lurker.render_diff_summary(
+                {
+                    "new": [],
+                    "regressions": [
+                        {
+                            "path": "/admin",
+                            "reasons": [
+                                {
+                                    "type": "unsafe_header_value",
+                                    "header": "x-frame-options",
+                                    "old_value": "DENY",
+                                    "new_value": "ALLOWALL",
+                                    "reason": "must be DENY or SAMEORIGIN",
+                                }
+                            ],
+                        }
+                    ],
+                    "removed": [],
+                }
+            )
+        finally:
+            lurker.NO_COLOR = previous_no_color
+
+        self.assertIn(
+            "unsafe value: x-frame-options changed to 'ALLOWALL' (must be DENY or SAMEORIGIN)",
+            summary,
+        )
 
     def test_detect_changes_flags_status_change(self):
         old_state = {
@@ -294,6 +613,33 @@ class TestDiscordNotifier(unittest.TestCase):
         self.assertIn("New: /new-admin", message)
         self.assertIn("Regressions: /admin (missing headers: Content-Security-Policy)", message)
         self.assertIn("Removed: /legacy", message)
+
+    def test_format_alert_message_describes_unsafe_header_values(self):
+        message = lurker.format_alert_message(
+            {
+                "new": [],
+                "regressions": [
+                    {
+                        "path": "/admin",
+                        "reasons": [
+                            {
+                                "type": "unsafe_header_value",
+                                "header": "x-frame-options",
+                                "old_value": "DENY",
+                                "new_value": "ALLOWALL",
+                                "reason": "must be DENY or SAMEORIGIN",
+                            }
+                        ],
+                    }
+                ],
+                "removed": [],
+            }
+        )
+
+        self.assertIn(
+            "unsafe value: x-frame-options changed to 'ALLOWALL' (must be DENY or SAMEORIGIN)",
+            message,
+        )
 
     def test_format_alert_message_returns_none_when_no_changes(self):
         result = lurker.format_alert_message({"new": [], "regressions": [], "removed": []})
@@ -435,6 +781,80 @@ class TestCliAndConfig(unittest.TestCase):
         self.assertTrue(
             any("Failed to send Discord alert" in message for message in printed_messages)
         )
+
+    @patch("builtins.print")
+    def test_first_scan_reports_missing_security_headers(self, mock_print):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wordlist_path = os.path.join(temp_dir, "wordlist.txt")
+            with open(wordlist_path, "w", encoding="utf-8") as wordlist_file:
+                wordlist_file.write("/admin\n")
+
+            with patch("lurker.probe_endpoint", return_value=(200, {})):
+                with patch(
+                    "lurker.scan_target",
+                    return_value=(
+                        {
+                            "/admin": {
+                                "status": 200,
+                                "headers": {"x-frame-options": "DENY"},
+                            }
+                        },
+                        [],
+                    ),
+                ):
+                    lurker.main([
+                        "scan",
+                        "--url",
+                        "http://example.com",
+                        "--wordlist",
+                        wordlist_path,
+                        "--output-dir",
+                        temp_dir,
+                    ])
+
+        printed_messages = [call.args[0] for call in mock_print.call_args_list if call.args]
+        self.assertTrue(
+            any("missing headers: Content-Security-Policy" in message for message in printed_messages)
+        )
+
+    @patch("builtins.print")
+    def test_first_scan_does_not_report_missing_headers_when_complete(self, mock_print):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wordlist_path = os.path.join(temp_dir, "wordlist.txt")
+            with open(wordlist_path, "w", encoding="utf-8") as wordlist_file:
+                wordlist_file.write("/admin\n")
+
+            complete_headers = {
+                "Content-Security-Policy": "default-src 'self'",
+                "X-Frame-Options": "DENY",
+                "Strict-Transport-Security": "max-age=31536000",
+            }
+
+            with patch("lurker.probe_endpoint", return_value=(200, {})):
+                with patch(
+                    "lurker.scan_target",
+                    return_value=(
+                        {
+                            "/admin": {
+                                "status": 200,
+                                "headers": complete_headers,
+                            }
+                        },
+                        [],
+                    ),
+                ):
+                    lurker.main([
+                        "scan",
+                        "--url",
+                        "http://example.com",
+                        "--wordlist",
+                        wordlist_path,
+                        "--output-dir",
+                        temp_dir,
+                    ])
+
+        printed_messages = [call.args[0] for call in mock_print.call_args_list if call.args]
+        self.assertFalse(any("missing headers:" in message for message in printed_messages))
 
     def test_load_config_overrides(self):
         with tempfile.TemporaryDirectory() as temp_dir:

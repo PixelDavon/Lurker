@@ -4,6 +4,7 @@ import datetime
 import importlib.util
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -35,6 +36,9 @@ HEADERS_TO_STORE = {
     "content-security-policy",
     "x-frame-options",
     "strict-transport-security",
+    "x-content-type-options",
+    "referrer-policy",
+    "permissions-policy",
 }
 
 ANSI_RESET = "\033[0m"
@@ -51,6 +55,35 @@ REQUIRED_SECURITY_HEADERS = {
 }
 REQUIRED_SECURITY_HEADERS_LOWER = {
     header.lower() for header in REQUIRED_SECURITY_HEADERS
+}
+HEADER_VALUE_POLICIES = {
+    "x-frame-options": {
+        "type": "allowlist",
+        "safe_values": {"deny", "sameorigin"},
+        "reason": "must be DENY or SAMEORIGIN",
+    },
+    "strict-transport-security": {
+        "type": "max-age",
+        "min_max_age": 31536000,
+        "reason": "max-age must be at least 31536000",
+    },
+    "x-content-type-options": {
+        "type": "exact",
+        "safe_value": "nosniff",
+        "reason": "must be nosniff",
+    },
+    "content-security-policy": {
+        "type": "csp",
+        "reason": "must not be empty, *, unsafe-inline, or unsafe-eval",
+    },
+    "referrer-policy": {
+        "type": "denylist",
+        "unsafe_values": {"", "unsafe-url", "no-referrer-when-downgrade"},
+        "reason": "must not be empty, unsafe-url, or no-referrer-when-downgrade",
+    },
+    "permissions-policy": {
+        "type": "presence_only",
+    },
 }
 # Global flag to disable ANSI coloring when requested via CLI
 NO_COLOR = False
@@ -172,6 +205,61 @@ def _filter_stored_headers(headers_dict):
         for header, value in headers_dict.items()
         if header.lower() in HEADERS_TO_STORE
         }
+
+
+def validate_header_values(headers_dict):
+    unsafe_headers = []
+
+    for header, value in headers_dict.items():
+        policy = HEADER_VALUE_POLICIES.get(header.lower())
+        if policy is None:
+            continue
+
+        normalized_value = "" if value is None else str(value)
+        stripped_value = normalized_value.strip()
+        lower_value = stripped_value.lower()
+        reason = None
+
+        policy_type = policy["type"]
+        if policy_type == "presence_only":
+            continue
+        if policy_type == "allowlist":
+            safe_values = {safe_value.lower() for safe_value in policy["safe_values"]}
+            if lower_value not in safe_values:
+                reason = policy["reason"]
+        elif policy_type == "max-age":
+            match = re.search(r"(?i)\bmax-age\s*=\s*([^;]+)", normalized_value)
+            if not match:
+                reason = "missing max-age"
+            else:
+                max_age_value = match.group(1).strip().strip("\"'")
+                try:
+                    max_age = int(max_age_value)
+                except ValueError:
+                    reason = "invalid max-age"
+                else:
+                    if max_age < policy["min_max_age"]:
+                        reason = policy["reason"]
+        elif policy_type == "exact":
+            if lower_value != policy["safe_value"]:
+                reason = policy["reason"]
+        elif policy_type == "csp":
+            tokens = re.split(r"[\s;]+", stripped_value) if stripped_value else []
+            if (
+                not stripped_value
+                or "*" in tokens
+                or "unsafe-inline" in lower_value
+                or "unsafe-eval" in lower_value
+            ):
+                reason = policy["reason"]
+        elif policy_type == "denylist":
+            if lower_value in policy["unsafe_values"]:
+                reason = policy["reason"]
+
+        if reason:
+            unsafe_headers.append({"header": header.lower(), "value": value, "reason": reason})
+
+    return unsafe_headers
 
 def load_wordlist(wordlist_path):
     with open(wordlist_path, "r", encoding="utf-8") as wordlist_file:
@@ -295,6 +383,27 @@ def detect_changes(old_state, new_state):
                 }
             )
 
+        old_value_issues = {
+            issue["header"]: issue for issue in validate_header_values(old_headers)
+        }
+        new_value_issues = {
+            issue["header"]: issue for issue in validate_header_values(new_headers)
+        }
+        for header, issue in new_value_issues.items():
+            if header not in old_headers:
+                continue
+            if header in old_value_issues:
+                continue
+            regression_reasons.append(
+                {
+                    "type": "unsafe_header_value",
+                    "header": header,
+                    "old_value": old_headers.get(header),
+                    "new_value": issue.get("value"),
+                    "reason": issue.get("reason"),
+                }
+            )
+
         if regression_reasons:
             regressions.append({"path": path, "reasons": regression_reasons})
     return {
@@ -302,6 +411,27 @@ def detect_changes(old_state, new_state):
         "regressions": sorted(regressions, key=lambda item: item["path"]),
         "removed": removed_paths,
     }
+
+
+def audit_first_scan(scan_results):
+    regressions = []
+
+    for path, entry in scan_results.items():
+        missing_headers = analyze_headers(entry.get("headers", {}))
+        if missing_headers:
+            regressions.append(
+                {
+                    "path": path,
+                    "reasons": [
+                        {
+                            "type": "missing_security_headers",
+                            "missing": missing_headers,
+                        }
+                    ],
+                }
+            )
+
+    return sorted(regressions, key=lambda item: item["path"])
 
 def send_discord_alert(webhook_url, message):
     if not message:
@@ -315,6 +445,21 @@ def send_discord_alert(webhook_url, message):
     )
     with urllib.request.urlopen(request, timeout=10):
         return
+
+
+def _describe_regression_reason(reason):
+    reason_type = reason.get("type", "unknown")
+    if reason_type == "status_change":
+        return f"status {reason.get('old')} -> {reason.get('new')}"
+    if reason_type == "missing_security_headers":
+        missing = ", ".join(reason.get("missing", [])) or "none"
+        return f"missing headers: {missing}"
+    if reason_type == "unsafe_header_value":
+        return (
+            f"unsafe value: {reason.get('header')} changed to '{reason.get('new_value')}' "
+            f"({reason.get('reason')})"
+        )
+    return reason_type
 
 def format_alert_message(diff_results):
     new_paths = diff_results.get("new", [])
@@ -331,16 +476,7 @@ def format_alert_message(diff_results):
         path = regression.get("path", "<unknown>")
         reason_summaries = []
         for reason in regression.get("reasons", []):
-            reason_type = reason.get("type", "unknown")
-            if reason_type == "status_change":
-                reason_summaries.append(
-                    f"status {reason.get('old')} -> {reason.get('new')}"
-                )
-            elif reason_type == "missing_security_headers":
-                missing = ", ".join(reason.get("missing", [])) or "none"
-                reason_summaries.append(f"missing headers: {missing}")
-            else:
-                reason_summaries.append(reason_type)
+            reason_summaries.append(_describe_regression_reason(reason))
         details = "; ".join(reason_summaries) if reason_summaries else "unspecified"
         regression_summaries.append(f"{path} ({details})")
 
@@ -370,16 +506,7 @@ def render_diff_summary(diff_results):
             path = regression.get("path", "<unknown>")
             reason_summaries = []
             for reason in regression.get("reasons", []):
-                reason_type = reason.get("type", "unknown")
-                if reason_type == "status_change":
-                    reason_summaries.append(
-                        f"status {reason.get('old')} -> {reason.get('new')}"
-                    )
-                elif reason_type == "missing_security_headers":
-                    missing = ", ".join(reason.get("missing", [])) or "none"
-                    reason_summaries.append(f"missing headers: {missing}")
-                else:
-                    reason_summaries.append(reason_type)
+                reason_summaries.append(_describe_regression_reason(reason))
             details = "; ".join(reason_summaries) if reason_summaries else "unspecified"
             lines.append(f"  ! {path}: {details}")
     if removed_paths:
@@ -467,6 +594,14 @@ def _run_scan(args, config):
     )
 
     diff_results = detect_changes(previous_state, scan_results)
+    if not previous_state:
+        first_scan_regressions = audit_first_scan(scan_results)
+        if first_scan_regressions:
+            diff_results = dict(diff_results)
+            diff_results["regressions"] = sorted(
+                diff_results["regressions"] + first_scan_regressions,
+                key=lambda item: item["path"],
+            )
     summary = render_diff_summary(diff_results)
     print(summary)
     if failures:

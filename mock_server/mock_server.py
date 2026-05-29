@@ -51,13 +51,45 @@ VALID_PATHS4=[
     "NEW1", "NEW2", "NEW3","NEW4","NEW5" # new
 ]
 
+VALID_PATHS5 = list(VALID_PATHS3)
+VALID_PATHS6 = list(VALID_PATHS3)
+VALID_PATHS7 = [
+    path
+    for path in VALID_PATHS3
+    if path not in {"css", "js", "fonts", "media"}
+] + ["DEMO1", "DEMO2", "DEMO3"]
+
+VALID_PATH_HEADERS5 = {
+    "admin": {"X-Frame-Options": "ALLOWALL"},
+    "api": {"Strict-Transport-Security": "max-age=100"},
+    "dashboard": {"Content-Security-Policy": "unsafe-inline"},
+    "login": {"Referrer-Policy": "unsafe-url"},
+}
+VALID_PATH_HEADERS6 = {
+    path: headers
+    for path, headers in {
+        "admin": {"X-Frame-Options": "DENY"},
+        "api": {"Strict-Transport-Security": "max-age=31536000"},
+        "dashboard": {"Content-Security-Policy": "default-src 'self'"},
+        "login": {"Referrer-Policy": "strict-origin-when-cross-origin"},
+    }.items()
+    if path in VALID_PATHS3
+}
+VALID_PATH_HEADERS7 = dict(VALID_PATH_HEADERS5)
+
+# SWITCH ACTIVE PATH/HEADER
+ACTIVE_VALID_PATHS = VALID_PATHS7
+ACTIVE_VALID_PATH_HEADERS = VALID_PATH_HEADERS7
+
 class MyHttpRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         path = self.path.strip("/")
         display_path = path or ""
-        if not path or path in VALID_PATHS4: # feel free to switch to VALID_PATHS[1,2,3,4]
+        if not path or path in ACTIVE_VALID_PATHS:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            for header_name, header_value in ACTIVE_VALID_PATH_HEADERS.get(path, {}).items():
+                self.send_header(header_name, header_value)
             self.end_headers()
             self.wfile.write(f"<html><body><h1>This is /{display_path}</h1></body></html>".encode("utf-8"))
         else:
